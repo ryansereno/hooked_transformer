@@ -212,7 +212,7 @@ class MLP(nn.Module):
 rand_float_test(MLP, [2, 4, 768])
 
 
-class Block(mm.Moduele):
+class Block(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
@@ -233,3 +233,25 @@ class Block(mm.Moduele):
         if self.cfg.debug:
             print("Output:", x.shape)
         return x
+
+
+rand_float_test(Block, [2, 4, 768])
+
+
+class Unembed(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.W_T = nn.Parameter(torch.empty(cfg.d_model, cfg.d_vocab))
+        nn.init.normal_(self.W_T, std=self.cfg.init_range)
+
+    def forward(self, x):
+        if self.cfg.debug:
+            print("Input:", x.shape)
+        x = torch.matmul(x, self.W_T)
+        if self.cfg.debug:
+            print("Output:", x.shape)
+        return x
+
+
+rand_float_test(Unembed, [2, 4, 768])
