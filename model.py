@@ -9,8 +9,8 @@ from dataclasses import dataclass
 
 @dataclass
 class Config:
-    d_model: int = 768
     debug: bool = False
+    d_model: int = 768
     layer_norm_eps: float = 1e-5
     d_vocab: int = 50257
     init_range: float = 0.02
@@ -18,6 +18,7 @@ class Config:
     d_head = 64
     d_mlp = 3072
     n_heads = 12
+    n_attn_blocks = 12
 
 
 cfg = Config()
@@ -248,10 +249,34 @@ class Unembed(nn.Module):
     def forward(self, x):
         if self.cfg.debug:
             print("Input:", x.shape)
-        x = torch.matmul(x, self.W_T)
+        logits = torch.matmul(x, self.W_T)
         if self.cfg.debug:
             print("Output:", x.shape)
-        return x
+        return logits
 
 
 rand_float_test(Unembed, [2, 4, 768])
+
+
+class Transformer(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.embed = Embed(cfg)
+        self.pos_embed = PosEmbed(cfg)
+        self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_attn_blocks)])
+        self.ln_final = LayerNorm(cfg)
+        self.unembed = Unembed(cfg)
+
+    def forward(self, tokens):
+        embed = self.embed(tokens)
+        pos_embed = self.pos_embed(tokens)
+        residual = embed + pos_embed
+        for block in self.blocks:
+            residual = block(residual)
+        normalized_resid_final = self.ln_final(residual)
+        logits = self.unembed(normalized_resid_final)
+        return logits
+
+
+rand_int_test(Transformer, [2, 4])
