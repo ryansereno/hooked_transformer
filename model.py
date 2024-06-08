@@ -46,6 +46,29 @@ def rand_int_test(cls, shape):
     return output
 
 
+class Embed(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.W_E = nn.Parameter(torch.empty(cfg.d_vocab, cfg.d_model))
+        nn.init.normal_(self.W_E, std=self.cfg.init_range)
+
+    def forward(self, tokens):
+        # tokens: [batch_size, position]
+        if self.cfg.debug:
+            print("Input:", tokens.shape)
+        embed = self.W_E[tokens, :]
+        if self.cfg.debug:
+            print("Output:", embed.shape)
+        return embed
+
+
+# batch size of 2, meaning 2 sentences
+# position/ seq_lenq of 4, meaning 4 words in each sentence
+# you will get out a tensor of shape [2, 4, 768], because each word is represented by a 768-dimensional vector
+rand_int_test(Embed, [2, 4])
+
+
 class LayerNorm(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -75,29 +98,6 @@ class LayerNorm(nn.Module):
 
 
 rand_float_test(LayerNorm, [2, 4, 768])
-
-
-class Embed(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.cfg = cfg
-        self.W_E = nn.Parameter(torch.empty(cfg.d_vocab, cfg.d_model))
-        nn.init.normal_(self.W_E, std=self.cfg.init_range)
-
-    def forward(self, tokens):
-        # tokens: [batch_size, position]
-        if self.cfg.debug:
-            print("Input:", tokens.shape)
-        embed = self.W_E[tokens, :]
-        if self.cfg.debug:
-            print("Output:", embed.shape)
-        return embed
-
-
-# batch size of 2, meaning 2 sentences
-# position/ seq_lenq of 4, meaning 4 words in each sentence
-# you will get out a tensor of shape [2, 4, 768], because each word is represented by a 768-dimensional vector
-rand_int_test(Embed, [2, 4])
 
 
 # acts in parallel to the embedding layer; they are not dependent on each other
@@ -210,3 +210,26 @@ class MLP(nn.Module):
 
 
 rand_float_test(MLP, [2, 4, 768])
+
+
+class Block(mm.Moduele):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.norm1 = LayerNorm(cfg)
+        self.attn = SelfAttention(cfg)
+        self.norm2 = LayerNorm(cfg)
+        self.mlp = MLP(cfg)
+
+    def forward(self, x):
+        if self.cfg.debug:
+            print("Input:", x.shape)
+        x = self.norm1(x)
+        x = self.attn(x)
+        x = x + x  # Residual connection
+        x = self.norm2(x)
+        x = self.mlp(x)
+        x = x + x  # Residual connection
+        if self.cfg.debug:
+            print("Output:", x.shape)
+        return x
