@@ -10,8 +10,7 @@ from transformers import GPT2Tokenizer, GPT2LMHeadModel
 
 tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 gpt2 = GPT2LMHeadModel.from_pretrained("gpt2")
-print("attention weight shape", gpt2.transformer.h[0].attn.c_attn.weight.shape)
-text = "abcdefgh"
+text = "abcde"
 encoded_input = tokenizer(text, return_tensors="pt")
 tokens = encoded_input["input_ids"]  # Extract token ids
 
@@ -132,7 +131,10 @@ class LayerNorm(nn.Module):
         if self.cfg.debug:
             print("Normalized:", y.shape)
 
-        return y
+        # return y
+        return torch.nn.functional.layer_norm(
+            x, self.weight.shape, self.weight, self.bias, 1e-5
+        )
 
 
 # rand_float_test(LayerNorm, [2, 4, 768])
@@ -190,7 +192,7 @@ class SelfAttention(nn.Module):
         return y
 
 
-rand_float_test(SelfAttention, [2, 4, 768])
+# rand_float_test(SelfAttention, [2, 4, 768])
 
 
 class MLP(nn.Module):
@@ -227,15 +229,15 @@ class Block(nn.Module):
     def forward(self, x):
         if self.cfg.debug:
             print("Input:", x.shape)
-        x = self.ln_1(x)
-        x = self.attn(x)
-        x = x + x  # Residual connection
-        x = self.ln_2(x)
-        x = self.mlp(x)
-        x = x + x  # Residual connection
+        x_norm = self.ln_1(x)
+        z = self.attn(x_norm)
+        z = z + x  # Residual connection
+        z_norm = self.ln_2(z)
+        z_proj = self.mlp(z_norm)
+        z_proj = z_proj + x  # Residual connection
         if self.cfg.debug:
             print("Output:", x.shape)
-        return x
+        return z_proj
 
 
 # rand_float_test(Block, [2, 4, 768])
@@ -254,6 +256,7 @@ class Transformer(nn.Module):
             )
         )
         self.lm_head = nn.Linear(cfg.d_embd, cfg.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight
 
     def forward(self, idx):
         b, t = idx.size()
@@ -269,6 +272,7 @@ class Transformer(nn.Module):
         for block in self.transformer.h:
             x = block(x)
         # inference-time mini-optimization: only forward the lm_head on the very last position
+        x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
         return logits
 
@@ -293,19 +297,26 @@ def from_pretrained(target_model, pretrained_model):
     sd_keys_hf = [
         k for k in sd_keys_hf if not k.endswith(".attn.bias")
     ]  # same, just the mask (buffer)
-    transposed = [
+    should_transpose = [
         "attn.c_attn.weight",
         "attn.c_proj.weight",
         "mlp.c_fc.weight",
         "mlp.c_proj.weight",
     ]
+    #  print("target model keys")
+    #  for key in sd_keys:
+    #      print(key)
+    #  print()
+    #  print("pretrained model keys")
+    #  for key in sd_keys_hf:
+    #      print(key)
     # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
     # this means that we have to transpose these weights when we import them
     assert len(sd_keys_hf) == len(
         sd_keys
     ), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
     for k in sd_keys_hf:
-        if any(k.endswith(w) for w in transposed):
+        if any(k.endswith(w) for w in should_transpose):
             # special treatment for the Conv1D weights we need to transpose
             assert sd_hf[k].shape[::-1] == sd[k].shape
             with torch.no_grad():
@@ -318,11 +329,9 @@ def from_pretrained(target_model, pretrained_model):
             with torch.no_grad():
                 sd[k].copy_(sd_hf[k])
 
-    return model
-
 
 model = Transformer(cfg)
-model = from_pretrained(model, gpt2)
+from_pretrained(model, gpt2)
 # for key in model.state_dict().keys():
 # print(key)
 
@@ -332,7 +341,18 @@ output = torch.softmax(output, dim=-1)
 predicted_token_ids = torch.argmax(
     output, dim=-1
 )  # Get the most likely next token ID for each position
-print(predicted_token_ids)
-print("Predicted tokens:", predicted_token_ids.shape)
-tokens = tokenizer.decode(predicted_token_ids[-1])
-print(tokens)
+print("Predicted tokens:", predicted_token_ids)
+output_text = tokenizer.decode(predicted_token_ids[-1][-1])
+print(output_text)
+
+for i in range(10):
+    encoded_input = tokenizer(text, return_tensors="pt")
+    tokens = encoded_input["input_ids"]  # Extract token ids
+    output = model(tokens)
+    output = torch.softmax(output, dim=-1)
+    predicted_token_ids = torch.argmax(
+        output, dim=-1
+    )  # Get the most likely next token ID for each position
+    output_token = tokenizer.decode(predicted_token_ids[-1][-1])
+    text += output_token
+    print(text)
