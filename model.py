@@ -6,17 +6,14 @@ import einops
 import einsum
 from dataclasses import dataclass
 
-from transformers import GPT2Tokenizer, GPT2Model
+from transformers import GPT2Tokenizer, GPT2LMHeadModel
 
 tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-gpt2 = GPT2Model.from_pretrained("gpt2")
-
-text = "Silence is the language of god, all else is poor translation."
+gpt2 = GPT2LMHeadModel.from_pretrained("gpt2")
+print("attention weight shape", gpt2.transformer.h[0].attn.c_attn.weight.shape)
+text = "abcdefgh"
 encoded_input = tokenizer(text, return_tensors="pt")
 tokens = encoded_input["input_ids"]  # Extract token ids
-
-
-print(gpt2)
 
 
 @dataclass
@@ -65,14 +62,14 @@ class Embed(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.W_E = nn.Parameter(torch.empty(cfg.vocab_size, cfg.d_embd))
-        nn.init.normal_(self.W_E, std=self.cfg.initializer_range)
+        self.wte = nn.Parameter(torch.empty(cfg.vocab_size, cfg.d_embd))
+        nn.init.normal_(self.wte, std=self.cfg.initializer_range)
 
     def forward(self, tokens):
         # tokens: [batch_size, position]
         if self.cfg.debug:
             print("Input:", tokens.shape)
-        embed = self.W_E[tokens, :]
+        embed = self.wte[tokens, :]
         if self.cfg.debug:
             print("Output:", embed.shape)
         return embed
@@ -83,31 +80,21 @@ class Embed(nn.Module):
 # you will get out a tensor of shape [2, 4, 768], because each word is represented by a 768-dimensional vector
 # rand_int_test(Embed, [2, 4])
 
-embed_layer = Embed(cfg)
-# Extract pretrained embedding weights
-pretrained_embedding_weights = gpt2.wte.weight.data
-
-# Load these weights into embedding layer
-embed_layer.W_E.data.copy_(pretrained_embedding_weights)
-
-embedded_output = embed_layer(tokens)
-print(embedded_output)
-
 
 # acts in parallel to the embedding layer; they are not dependent on each other
 class PosEmbed(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.W_pos = nn.Parameter(torch.empty((cfg.n_ctx, cfg.d_embd)))
-        nn.init.normal_(self.W_pos, std=self.cfg.initializer_range)
+        self.wpe = nn.Parameter(torch.empty((cfg.n_ctx, cfg.d_embd)))
+        nn.init.normal_(self.wpe, std=self.cfg.initializer_range)
 
     def forward(self, tokens):
         # tokens: [batch_size, position]
         if self.cfg.debug:
             print("Input:", tokens.shape)
         # Select the positional embeddings up to the max sequence length in 'tokens'
-        pos_embed = self.W_pos[: tokens.size(1), :]
+        pos_embed = self.wpe[: tokens.size(1), :]
         # Expand position embeddings to match the batch size in the first dimension
         pos_embed = pos_embed.unsqueeze(0).repeat(
             tokens.size(0), 1, 1
@@ -118,23 +105,14 @@ class PosEmbed(nn.Module):
 
 
 # rand_int_test(PosEmbed, [2, 4])
-pos_layer = PosEmbed(cfg)
-# Extract pretrained pos embedding weights
-pretrained_pos_embd_weights = gpt2.wpe.weight.data
-
-# Load these weights into pos embedding layer
-pos_layer.W_pos.data.copy_(pretrained_pos_embd_weights)
-
-embedded_output = embedded_output + pos_layer(tokens)  # dimensionality proplem here
-print(embedded_output)
 
 
 class LayerNorm(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.w = nn.Parameter(torch.ones(cfg.d_embd))
-        self.b = nn.Parameter(torch.zeros(cfg.d_embd))
+        self.weight = nn.Parameter(torch.ones(cfg.d_embd))
+        self.bias = nn.Parameter(torch.zeros(cfg.d_embd))
 
     def forward(self, x):
         # x: [batch_size, position, d_embd]
@@ -149,7 +127,7 @@ class LayerNorm(nn.Module):
         x_norm = (x - mean) / torch.sqrt(var + cfg.layer_norm_epsilon)
 
         # Apply learnable parameters
-        y = x_norm * self.w + self.b
+        y = x_norm * self.weight + self.bias
 
         if self.cfg.debug:
             print("Normalized:", y.shape)
@@ -164,11 +142,10 @@ class SelfAttention(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        # key, query, value projections for all heads, but in a batch
-        self.W_Q = nn.Linear(cfg.d_embd, cfg.n_heads * cfg.d_head)
-        self.W_K = nn.Linear(cfg.d_embd, cfg.n_heads * cfg.d_head)
-        self.W_V = nn.Linear(cfg.d_embd, cfg.n_heads * cfg.d_head)
-        self.W_O = nn.Linear(cfg.n_heads * cfg.d_head, cfg.d_embd)
+        # key, query, value projections for all heads, but in a single linear layer
+        self.c_attn = nn.Linear(cfg.d_embd, 3 * cfg.d_embd)
+        # output projection
+        self.c_proj = nn.Linear(cfg.d_embd, cfg.d_embd)
         self.register_buffer(
             "bias",
             torch.tril(torch.ones(cfg.n_ctx, cfg.n_ctx)).view(
@@ -176,68 +153,60 @@ class SelfAttention(nn.Module):
             ),
         )
 
-    def forward(self, normalized_resid_pre):
+    def forward(self, x):
         if self.cfg.debug:
-            print("Normalized_resid_pre:", normalized_resid_pre.shape)
+            print("Normalized_resid_pre:", x.shape)
 
-        batch_size, seq_len, d_embd = normalized_resid_pre.shape
-        n_heads, d_head = self.cfg.n_heads, self.cfg.d_head
+        # batch size, sequence length, embedding dimensionality (n_embd)
+        (
+            B,
+            T,
+            C,
+        ) = x.size()
 
-        # Linear projections for Q, K, V
-        Q = self.W_Q(
-            normalized_resid_pre
-        )  # Shape: [batch_size, seq_len, n_heads * d_head]
-        K = self.W_K(
-            normalized_resid_pre
-        )  # Shape: [batch_size, seq_len, n_heads * d_head]
-        V = self.W_V(
-            normalized_resid_pre
-        )  # Shape: [batch_size, seq_len, n_heads * d_head]
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v = self.c_attn(x).split(self.cfg.d_embd, dim=2)
 
-        # Reshape and permute to [batch_size, n_heads, seq_len, d_head]
-        Q = Q.view(batch_size, seq_len, n_heads, d_head).permute(0, 2, 1, 3)
-        K = K.view(batch_size, seq_len, n_heads, d_head).permute(0, 2, 1, 3)
-        V = V.view(batch_size, seq_len, n_heads, d_head).permute(0, 2, 1, 3)
+        k = k.view(B, T, self.cfg.n_heads, C // self.cfg.n_heads).transpose(
+            1, 2
+        )  # (B, nh, T, hs)
+        q = q.view(B, T, self.cfg.n_heads, C // self.cfg.n_heads).transpose(
+            1, 2
+        )  # (B, nh, T, hs)
+        v = v.view(B, T, self.cfg.n_heads, C // self.cfg.n_heads).transpose(
+            1, 2
+        )  # (B, nh, T, hs)
 
-        # Scaled dot-product attention
-        attn = torch.matmul(Q, K.transpose(-2, -1)) / (d_head**0.5)
-        attn = attn.masked_fill(self.bias[:, :, :seq_len, :seq_len] == 0, float("-inf"))
-        attn = torch.nn.functional.softmax(attn, dim=-1)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        att = torch.nn.functional.softmax(att, dim=-1)
+        y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = (
+            y.transpose(1, 2).contiguous().view(B, T, C)
+        )  # re-assemble all head outputs side by side
 
-        # Weighted sum of values
-        z = torch.matmul(attn, V)  # Shape: [batch_size, n_heads, seq_len, d_head]
-
-        # Concatenate heads and apply final linear projection
-        z = (
-            z.permute(0, 2, 1, 3)
-            .contiguous()
-            .view(batch_size, seq_len, n_heads * d_head)
-        )
-        output = self.W_O(z)
-
-        if self.cfg.debug:
-            print("Output shape:", output.shape)
-
-        return output
+        # output projection
+        y = self.c_proj(y)
+        return y
 
 
-# rand_float_test(SelfAttention, [2, 4, 768])
+rand_float_test(SelfAttention, [2, 4, 768])
 
 
 class MLP(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.W_in = nn.Linear(cfg.d_embd, cfg.d_inner)
+        self.c_fc = nn.Linear(cfg.d_embd, cfg.d_inner)
         self.gelu = nn.GELU()
-        self.W_out = nn.Linear(cfg.d_inner, cfg.d_embd)
+        self.c_proj = nn.Linear(cfg.d_inner, cfg.d_embd)
 
     def forward(self, x):
         if self.cfg.debug:
             print("Input:", x.shape)
-        x = self.W_in(x)
+        x = self.c_fc(x)
         x = self.gelu(x)
-        x = self.W_out(x)
+        x = self.c_proj(x)
         if self.cfg.debug:
             print("Output:", x.shape)
         return x
@@ -250,18 +219,18 @@ class Block(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.norm1 = LayerNorm(cfg)
+        self.ln_1 = LayerNorm(cfg)
         self.attn = SelfAttention(cfg)
-        self.norm2 = LayerNorm(cfg)
+        self.ln_2 = LayerNorm(cfg)
         self.mlp = MLP(cfg)
 
     def forward(self, x):
         if self.cfg.debug:
             print("Input:", x.shape)
-        x = self.norm1(x)
+        x = self.ln_1(x)
         x = self.attn(x)
         x = x + x  # Residual connection
-        x = self.norm2(x)
+        x = self.ln_2(x)
         x = self.mlp(x)
         x = x + x  # Residual connection
         if self.cfg.debug:
@@ -272,47 +241,98 @@ class Block(nn.Module):
 # rand_float_test(Block, [2, 4, 768])
 
 
-class Unembed(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.cfg = cfg
-        self.W_T = nn.Parameter(torch.empty(cfg.d_embd, cfg.vocab_size))
-        nn.init.normal_(self.W_T, std=self.cfg.initializer_range)
-
-    def forward(self, x):
-        if self.cfg.debug:
-            print("Input:", x.shape)
-        logits = torch.matmul(x, self.W_T)
-        if self.cfg.debug:
-            print("Output:", x.shape)
-        return logits
-
-
-# rand_float_test(Unembed, [2, 4, 768])
-
-
 class Transformer(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.embed = Embed(cfg)
-        self.pos_embed = PosEmbed(cfg)
-        self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
-        self.ln_final = LayerNorm(cfg)
-        self.unembed = Unembed(cfg)
+        self.transformer = nn.ModuleDict(
+            dict(
+                wte=nn.Embedding(cfg.vocab_size, cfg.d_embd),
+                wpe=nn.Embedding(cfg.n_ctx, cfg.d_embd),
+                h=nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)]),
+                ln_f=LayerNorm(cfg),
+            )
+        )
+        self.lm_head = nn.Linear(cfg.d_embd, cfg.vocab_size, bias=False)
 
-    def forward(self, tokens):
-        embed = self.embed(tokens)
-        pos_embed = self.pos_embed(tokens)
-        residual = embed + pos_embed
-        for block in self.blocks:
-            residual = block(residual)
-        normalized_resid_final = self.ln_final(residual)
-        logits = self.unembed(normalized_resid_final)
+    def forward(self, idx):
+        b, t = idx.size()
+        assert (
+            t <= self.cfg.n_ctx
+        ), f"Cannot forward sequence of length {t}, block size is only {self.cfg.n_ctx}"
+        pos = torch.arange(0, t, dtype=torch.long)  # shape (t)
+
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
+        x = tok_emb + pos_emb
+        for block in self.transformer.h:
+            x = block(x)
+        # inference-time mini-optimization: only forward the lm_head on the very last position
+        logits = self.lm_head(x)
         return logits
 
 
-rand_int_test(Transformer, [2, 4])
-# model = Transformer(cfg)
-# output = model(encoded_input['input_ids'])
-# print(output)
+# rand_int_test(Transformer, [2, 4])
+
+
+def from_pretrained(target_model, pretrained_model):
+    sd = target_model.state_dict()
+    sd_keys = sd.keys()
+    sd_keys = [
+        k for k in sd_keys if not k.endswith(".attn.bias")
+    ]  # discard this mask / buffer, not a param
+
+    model_hf = pretrained_model
+    sd_hf = model_hf.state_dict()
+    # copy while ensuring all of the parameters are aligned and match in names and shapes
+    sd_keys_hf = sd_hf.keys()
+    sd_keys_hf = [
+        k for k in sd_keys_hf if not k.endswith(".attn.masked_bias")
+    ]  # ignore these, just a buffer
+    sd_keys_hf = [
+        k for k in sd_keys_hf if not k.endswith(".attn.bias")
+    ]  # same, just the mask (buffer)
+    transposed = [
+        "attn.c_attn.weight",
+        "attn.c_proj.weight",
+        "mlp.c_fc.weight",
+        "mlp.c_proj.weight",
+    ]
+    # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+    # this means that we have to transpose these weights when we import them
+    assert len(sd_keys_hf) == len(
+        sd_keys
+    ), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+    for k in sd_keys_hf:
+        if any(k.endswith(w) for w in transposed):
+            # special treatment for the Conv1D weights we need to transpose
+            assert sd_hf[k].shape[::-1] == sd[k].shape
+            with torch.no_grad():
+                sd[k].copy_(sd_hf[k].t())
+        else:
+            # vanilla copy over the other parameters
+            assert (
+                sd_hf[k].shape == sd[k].shape
+            ), f"mismatched dims: {sd_hf[k].shape} != {sd[k].shape}"
+            with torch.no_grad():
+                sd[k].copy_(sd_hf[k])
+
+    return model
+
+
+model = Transformer(cfg)
+model = from_pretrained(model, gpt2)
+# for key in model.state_dict().keys():
+# print(key)
+
+output = model(tokens)
+# output = gpt2(tokens)
+output = torch.softmax(output, dim=-1)
+predicted_token_ids = torch.argmax(
+    output, dim=-1
+)  # Get the most likely next token ID for each position
+print(predicted_token_ids)
+print("Predicted tokens:", predicted_token_ids.shape)
+tokens = tokenizer.decode(predicted_token_ids[-1])
+print(tokens)
