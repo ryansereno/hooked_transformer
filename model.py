@@ -10,7 +10,7 @@ from transformers import GPT2Tokenizer, GPT2LMHeadModel
 
 tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 gpt2 = GPT2LMHeadModel.from_pretrained("gpt2")
-text = "abcde"
+text = "The capital of the United States is W"
 encoded_input = tokenizer(text, return_tensors="pt")
 tokens = encoded_input["input_ids"]  # Extract token ids
 
@@ -336,7 +336,7 @@ from_pretrained(model, gpt2)
 # print(key)
 
 output = model(tokens)
-# output = gpt2(tokens)
+#output = gpt2(tokens)
 output = torch.softmax(output, dim=-1)
 predicted_token_ids = torch.argmax(
     output, dim=-1
@@ -349,6 +349,7 @@ for i in range(10):
     encoded_input = tokenizer(text, return_tensors="pt")
     tokens = encoded_input["input_ids"]  # Extract token ids
     output = model(tokens)
+    #output = gpt2(tokens)
     output = torch.softmax(output, dim=-1)
     predicted_token_ids = torch.argmax(
         output, dim=-1
